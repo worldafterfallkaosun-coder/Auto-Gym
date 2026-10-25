@@ -1,18 +1,27 @@
 -- ============================================================
---  GYM AUTO — High School Anime | Delta / Roblox (Luau)
+--  GYM AUTO v2 — High School Anime | Delta / Roblox (Luau)
 --
---  Yang di-auto:
+--  Latihan yang di-handle:
+--   * Angkat beban : skill check ring (Space / TAP), baca jarum
+--   * Pull Up      : 2 note jatuh (F + J), ditekan pas nyampe tombol
+--   * Treadmill    : tap ritme di tombol RunButton
+--
+--  Yang di-auto (semua latihan):
 --   1. Pilih level otomatis (CFG.Level)
---   2. Skill check (ring + Space/TAP) ditekan otomatis pas jarum di zona
---   3. Berhenti + keluar otomatis kalau stat udah "SUDAH MAKSIMAL"
+--   2. Minigame dimainin otomatis
+--   3. Berhenti + keluar otomatis kalau stat "SUDAH MAKSIMAL"
 --   4. (opsional) masuk lagi ke mesin yang sama setelah sesi selesai
---   5. (opsional) FAST: pangkas waktu tunggu di sisi client
+--   5. (opsional) FAST: pangkas waktu tunggu ring (cuma angkat beban)
 --
 --  Cara kerja: script cuma nyetir minigame client yang sama kayak
---  pemain. Dia baca posisi zona dari tick di ring, ngukur kecepatan
---  jarum per frame, lalu nekan tombol 1 frame sebelum jarum masuk zona.
---  Server cuma nerima "Level" dan "Complete", jadi gak ada remote
---  yang dipalsuin.
+--  pemain, jadi gak ada remote yang dipalsuin.
+--   - Ring     : baca zona dari tick, ukur kecepatan jarum per frame,
+--                tekan 1 frame sebelum jarum masuk zona.
+--   - Pull Up  : tiap note jatuh dari atas ke tombolnya. Kecepatan note
+--                diukur dari posisinya per frame, lalu tombol F/J ditekan
+--                pas note nyampe (window game +-0.13 detik).
+--   - Treadmill: kecepatan lari = jumlah tap dalam 0.8 detik terakhir,
+--                jadi bot tap stabil ~TapRate kali/detik + sedikit acak.
 --
 --  Pakai: berdiri di mesin gym, trigger prompt-nya seperti biasa
 --  (atau nyalain AutoReenter), sisanya jalan sendiri.
@@ -20,15 +29,19 @@
 -- ============================================================
 
 local CFG = {
-    Level       = 5,      -- 1..5 (5 = 20 push, jarum paling cepat)
+    Level       = 5,      -- 1..5 (5 = paling berat / paling cepat)
     AutoLevel   = true,   -- klik pilih level otomatis
-    AutoHit     = true,   -- tekan skill check otomatis
+    AutoHit     = true,   -- main minigame otomatis
     StopOnMax   = true,   -- stop bot kalau toast "SUDAH MAKSIMAL"
     ExitOnMax   = true,   -- sekalian keluar dari mesin pas maksimal
     AutoReenter = false,  -- masuk lagi ke mesin terakhir pas sesi selesai
-    PressAt     = 0.30,   -- 0..1, posisi tekan di dalam zona (0.3 = agak awal)
+    PressAt     = 0.30,   -- ring: 0..1, posisi tekan di dalam zona (0.3 = agak awal)
 
-    -- FAST: ngepangkas jeda client (lead-in, gap antar ring, hold confetti).
+    PullLead    = 0.02,   -- pull up: tekan segini (detik) sebelum note nyampe
+    TapRate     = 7,      -- treadmill: tap per detik (level 5 butuh minimal ~5)
+    TapJitter   = 0.2,    -- treadmill: 0..1, acak jeda antar tap biar gak kaku
+
+    -- FAST (cuma ring/angkat beban): ngepangkas jeda client.
     -- Server mungkin punya batas waktu minimum. Kalau gain gak masuk, matiin.
     Fast        = false,
     FastValues  = { LeadIn = 0.25, GapMin = 0.15, GapMax = 0.30, CompleteHold = 1.0, MissCooldown = 0.3 },
@@ -82,6 +95,42 @@ local function fire(inst, sigName)
     return false
 end
 
+-- ---------- helper: "klik" tombol minigame (PullUp / TreadMill) ----------
+-- Handler tombol mereka dengerin InputBegan dan cuma baca .UserInputType,
+-- jadi input palsu berisi tabel kecil udah cukup. Kalau getconnections
+-- gak ada, jatuh ke keyboard virtual (F / J / Space).
+local FAKE_INPUT = { UserInputType = Enum.UserInputType.Touch, UserInputState = Enum.UserInputState.Begin }
+local usedMethod
+
+local function pressGui(btn, key)
+    if getconnections then
+        local fired = 0
+        pcall(function()
+            for _, c in ipairs(getconnections(btn.InputBegan)) do
+                local ok = pcall(function() c:Fire(FAKE_INPUT) end)
+                if ok then fired = fired + 1 end
+            end
+        end)
+        if fired > 0 then
+            if usedMethod ~= "connections" then
+                usedMethod = "connections"
+                print("[GymBot] tekan via getconnections")
+            end
+            return true
+        end
+    end
+    if key then
+        VIM:SendKeyEvent(true,  key, false, game)
+        VIM:SendKeyEvent(false, key, false, game)
+        if usedMethod ~= "vim" then
+            usedMethod = "vim"
+            print("[GymBot] tekan via VirtualInputManager (keyboard)")
+        end
+        return true
+    end
+    return false
+end
+
 -- ---------- tunggu GUI minigame ----------
 local gui = PGui:WaitForChild("GymMinigameGui", 30)
 if not gui then
@@ -117,7 +166,9 @@ if CFG.Fast then
     notify(patched and "FAST mode aktif" or "FAST gagal (executor gak support getgc)")
 end
 
--- ---------- tekan skill check ----------
+-- =====================================================================
+--  1) RING (angkat beban)
+-- =====================================================================
 local function press()
     local btn = gui:FindFirstChild("PushButton")
     if btn and fire(btn) then return end
@@ -172,6 +223,71 @@ track(RunService.RenderStepped:Connect(function()
         press()
     end
 end))
+
+-- =====================================================================
+--  2) PULL UP (note jatuh, lane F dan J)
+--  Layer "PullUpLayer": tombol "ButtonF"/"ButtonJ" + note bernama "Note"
+--  (clone tombol, Text = F atau J) yang jatuh dari Y=-0.12 ke Y tombol.
+--  Satu wave = 1 note per lane; keduanya harus kena (+-0.13 detik).
+-- =====================================================================
+local PULL_KEYS = { F = Enum.KeyCode.F, J = Enum.KeyCode.J }
+local noteInfo  = setmetatable({}, { __mode = "k" })   -- note -> {y, t, done}
+
+track(RunService.RenderStepped:Connect(function()
+    if not alive or not enabled or not CFG.AutoHit then return end
+    local layer = gui:FindFirstChild("PullUpLayer")
+    if not layer then return end
+
+    local now = os.clock()
+    for _, note in ipairs(layer:GetChildren()) do
+        if note.Name == "Note" and note:IsA("TextButton") then
+            local info = noteInfo[note]
+            if not info then
+                info = { y = note.Position.Y.Scale, t = now, done = false }
+                noteInfo[note] = info
+            elseif not info.done then
+                local y = note.Position.Y.Scale
+                if y ~= info.y then
+                    local dt = now - info.t
+                    local btn = layer:FindFirstChild("Button" .. note.Text)
+                    if btn and dt > 0 and y > info.y then
+                        local targetY = btn.Position.Y.Scale
+                        local speed   = (y - info.y) / dt            -- Y per detik
+                        local left    = (targetY - y) / speed        -- detik sampai nyampe
+                        local thr     = math.max(CFG.PullLead, dt * 0.5)
+                        if left <= thr then
+                            info.done = true
+                            pressGui(btn, PULL_KEYS[note.Text])
+                        end
+                    end
+                    info.y, info.t = y, now
+                end
+            end
+        end
+    end
+end))
+
+-- =====================================================================
+--  3) TREADMILL (tap ritme)
+--  Layer "TreadMillLayer" > Panel > "RunButton". Kecepatan = jumlah tap
+--  dalam 0.8 detik terakhir / (0.8 * TapsForMax), jadi tap stabil di atas
+--  ~5/detik udah cukup buat kecepatan penuh di semua level.
+-- =====================================================================
+local rng = Random.new()
+task.spawn(function()
+    while alive do
+        local layer = gui:FindFirstChild("TreadMillLayer")
+        local btn = layer and layer:FindFirstChild("RunButton", true)
+        if enabled and CFG.AutoHit and btn then
+            pressGui(btn, Enum.KeyCode.Space)
+            local base = 1 / math.max(CFG.TapRate, 1)
+            local j = CFG.TapJitter
+            task.wait(base * rng:NextNumber(1 - j * 0.5, 1 + j))
+        else
+            task.wait(0.2)
+        end
+    end
+end)
 
 -- ---------- auto pilih level ----------
 task.spawn(function()
