@@ -1,702 +1,269 @@
--- ╔═════════════════════════════════════════════════════════╗
--- ║  AUTO GYM v5 — modular, draggable UI, mobile-ready     ║
--- ║  Treadmill / Pullup / Pushup / Angkat Beban            ║
--- ╚═════════════════════════════════════════════════════════╝
--- language: Lua, runtime: Roblox LocalScript / Script Executor
+-- ============================================================
+--  GYM AUTO — High School Anime | Delta / Roblox (Luau)
+--
+--  Yang di-auto:
+--   1. Pilih level otomatis (CFG.Level)
+--   2. Skill check (ring + Space/TAP) ditekan otomatis pas jarum di zona
+--   3. Berhenti + keluar otomatis kalau stat udah "SUDAH MAKSIMAL"
+--   4. (opsional) masuk lagi ke mesin yang sama setelah sesi selesai
+--   5. (opsional) FAST: pangkas waktu tunggu di sisi client
+--
+--  Cara kerja: script cuma nyetir minigame client yang sama kayak
+--  pemain. Dia baca posisi zona dari tick di ring, ngukur kecepatan
+--  jarum per frame, lalu nekan tombol 1 frame sebelum jarum masuk zona.
+--  Server cuma nerima "Level" dan "Complete", jadi gak ada remote
+--  yang dipalsuin.
+--
+--  Pakai: berdiri di mesin gym, trigger prompt-nya seperti biasa
+--  (atau nyalain AutoReenter), sisanya jalan sendiri.
+--  Tombol "GYM BOT" di layar buat ON/OFF. PC: RightShift.
+-- ============================================================
 
--- [SERVICES]
-local Players    = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local UIS        = game:GetService("UserInputService")
-
-local lp = Players.LocalPlayer
-local pg = lp:WaitForChild("PlayerGui")
-
--- ══════════════════════════════════════════════════════════
--- CONFIG
--- ══════════════════════════════════════════════════════════
 local CFG = {
-    SC_EARLY     = 6,    -- degrees ahead of zone to fire ring
-    SC_COOLDOWN  = 0.20, -- seconds between ring presses
-    TM_INTERVAL  = 0.09, -- treadmill key interval
-    PU_INTERVAL  = 0.10, -- pullup key interval
-    POLL_RATE    = 0.18, -- exercise detection poll rate
-    NIL_THRESH   = 4,    -- consecutive nil polls → end session
-    COOLDOWN_DUR = 3.2,  -- seconds blocked after session end
-    DEBUG        = false,
+    Level       = 5,      -- 1..5 (5 = 20 push, jarum paling cepat)
+    AutoLevel   = true,   -- klik pilih level otomatis
+    AutoHit     = true,   -- tekan skill check otomatis
+    StopOnMax   = true,   -- stop bot kalau toast "SUDAH MAKSIMAL"
+    ExitOnMax   = true,   -- sekalian keluar dari mesin pas maksimal
+    AutoReenter = false,  -- masuk lagi ke mesin terakhir pas sesi selesai
+    PressAt     = 0.30,   -- 0..1, posisi tekan di dalam zona (0.3 = agak awal)
+
+    -- FAST: ngepangkas jeda client (lead-in, gap antar ring, hold confetti).
+    -- Server mungkin punya batas waktu minimum. Kalau gain gak masuk, matiin.
+    Fast        = false,
+    FastValues  = { LeadIn = 0.25, GapMin = 0.15, GapMax = 0.30, CompleteHold = 1.0, MissCooldown = 0.3 },
 }
 
--- ══════════════════════════════════════════════════════════
--- MODULE STATE
--- ══════════════════════════════════════════════════════════
-local MOD = {
-    treadmill  = { on=true, run=false, side=false },
-    pullup     = { on=true, run=false, side=false },
-    skillcheck = { on=true, fired=false, last=0 },
-}
+local Players        = game:GetService("Players")
+local RunService     = game:GetService("RunService")
+local UIS            = game:GetService("UserInputService")
+local VIM            = game:GetService("VirtualInputManager")
+local StarterGui     = game:GetService("StarterGui")
 
-local STATE       = "idle"   -- "idle" | "active" | "cooldown"
-local coolEnd     = 0
-local curEx       = nil      -- current exercise key
-local nilCount    = 0
-local connections = {}       -- cleanup list
+local LP   = Players.LocalPlayer
+local PGui = LP:WaitForChild("PlayerGui")
 
--- ══════════════════════════════════════════════════════════
--- INPUT LAYER
--- ══════════════════════════════════════════════════════════
-local function tapKey(kc)
-    if not pcall(function()
-        keypress(kc.Value); task.wait(0.035); keyrelease(kc.Value)
-    end) then
-        pcall(function()
-            local v = game:GetService("VirtualInputManager")
-            v:SendKeyEvent(true, kc, false, game)
-            task.wait(0.035)
-            v:SendKeyEvent(false, kc, false, game)
-        end)
-    end
+-- ---------- re-execute aman ----------
+local env = (getgenv and getgenv()) or _G
+if env.__GYMBOT_STOP then pcall(env.__GYMBOT_STOP) end
+
+local alive   = true
+local conns   = {}
+local enabled = true
+local sg
+
+local function track(c) conns[#conns + 1] = c; return c end
+env.__GYMBOT_STOP = function()
+    alive = false
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    if sg then pcall(function() sg:Destroy() end) end
 end
 
-local function fireBtn(btn)
-    if not btn or not btn.Visible then return end
-    if not pcall(function() firesignal(btn.Activated) end) then
-        pcall(function()
-            local v = game:GetService("VirtualInputManager")
-            local p = btn.AbsolutePosition + btn.AbsoluteSize * 0.5
-            v:SendMouseButtonEvent(p.X, p.Y, 0, true,  game, 1); task.wait(0.035)
-            v:SendMouseButtonEvent(p.X, p.Y, 0, false, game, 1)
-        end)
-    end
-end
-
--- ══════════════════════════════════════════════════════════
--- GYM GUI DETECTION
--- ══════════════════════════════════════════════════════════
-local gymGui, skillRing, pushBtn, needleFrm
-
-local GYM_NAMES = {
-    "GymMinigameGui","GymGui","GymUI","MinigameGui",
-    "GymGame","GymActivity","MinigameUI","GymHUD",
-}
-
-local function findGymGui()
-    -- Try known names
-    for _, name in ipairs(GYM_NAMES) do
-        local g = pg:FindFirstChild(name, true)
-        if g and g:IsA("ScreenGui") then return g end
-    end
-    -- Fallback: scan all ScreenGuis for gym keywords
-    for _, v in ipairs(pg:GetChildren()) do
-        if v:IsA("ScreenGui") and v ~= pg:FindFirstChild("AutoGymV5") then
-            local s = v.Name:lower()
-            if s:find("gym") or s:find("minigame") or s:find("exercise") then
-                return v
-            end
-        end
-    end
-    return nil
-end
-
-local function findSkillRing(gui)
-    -- Look for SkillCheck or similar ring container
-    for _, name in ipairs({"SkillCheck","Ring","SkillRing","MinigameRing","TimingRing"}) do
-        local f = gui:FindFirstChild(name, true)
-        if f then return f end
-    end
-    return nil
-end
-
-local function findNeedle(ring)
-    if not ring then return nil end
-    -- Needle: centered anchor, ZIndex 3, rotating
-    for _, v in ipairs(ring:GetChildren()) do
-        if v:IsA("Frame")
-        and math.abs(v.AnchorPoint.X - 0.5) < 0.02
-        and math.abs(v.AnchorPoint.Y - 0.5) < 0.02
-        and v.ZIndex >= 2
-        then
-            return v
-        end
-    end
-    -- Fallback: largest ZIndex child
-    local best, bz = nil, -1
-    for _, v in ipairs(ring:GetChildren()) do
-        if v:IsA("Frame") and v.ZIndex > bz then best=v; bz=v.ZIndex end
-    end
-    return best
-end
-
-local function findPushBtn(gui)
-    for _, name in ipairs({"PushButton","ActionButton","PressButton","Btn","Button"}) do
-        local b = gui:FindFirstChild(name, true)
-        if b and (b:IsA("TextButton") or b:IsA("ImageButton")) then return b end
-    end
-    return nil
-end
-
-local function initGymRefs()
-    gymGui   = findGymGui()
-    if not gymGui then return false end
-    skillRing = findSkillRing(gymGui)
-    needleFrm = findNeedle(skillRing)
-    pushBtn   = findPushBtn(gymGui)
-    return true
-end
-
--- Wait for gym GUI
-do
-    local t = os.clock()
-    repeat
-        if initGymRefs() then break end
-        task.wait(0.2)
-    until os.clock()-t > 60
-end
-if not gymGui then warn("[AutoGym] GymGui not found in 60s"); return end
-print("[AutoGym] GymGui found:", gymGui.Name)
-
--- ══════════════════════════════════════════════════════════
--- EXERCISE DETECTION
--- ══════════════════════════════════════════════════════════
-local EX_PATTERNS = {
-    -- Compound/specific first
-    { p="angkatbeban", t="skillcheck" },
-    { p="angkat",      t="skillcheck" },
-    { p="beban",       t="skillcheck" },
-    { p="dumbbell",    t="skillcheck" },
-    { p="barbel",      t="skillcheck" },
-    { p="treadmill",   t="treadmill"  },
-    { p="lari",        t="treadmill"  },
-    { p="cardio",      t="treadmill"  },
-    { p="pullup",      t="pullup"     },
-    { p="pull%-up",    t="pullup"     },
-    { p="chinup",      t="pullup"     },
-    { p="chin%-up",    t="pullup"     },
-    { p="tarik",       t="pullup"     },
-    { p="pushup",      t="skillcheck" },
-    { p="push%-up",    t="skillcheck" },
-    { p="bench",       t="skillcheck" },
-}
-
-local function matchText(text)
-    local t = text:lower():gsub("[%s%-_]+","")
-    for _, ep in ipairs(EX_PATTERNS) do
-        if t:find(ep.p) then return ep.t end
-    end
-end
-
-local function scanText(root, levelOnly)
-    for _, v in ipairs(root:GetChildren()) do
-        if v.Visible and (v:IsA("TextLabel") or v:IsA("TextButton")) then
-            local t = v.Text
-            if not levelOnly or t:lower():find("level") then
-                local m = matchText(t)
-                if m then return m end
-            end
-        end
-        local r = scanText(v, levelOnly)
-        if r then return r end
-    end
-end
-
-local function detectSkillRingActive()
-    if not skillRing then return false end
-    return skillRing.Visible and 
-           (not pcall(function()
-               assert(skillRing.GroupTransparency <= 0.5)
-           end) == false)
-end
-
-local function scanExercise()
-    -- Primary: ring visible = skill check type
-    if skillRing and skillRing.Visible then
-        -- Distinguish pushup vs angkat by text
-        local t = scanText(gymGui, false)
-        if t == "treadmill" or t == "pullup" then return t end
-        return "skillcheck"
-    end
-    -- Text scan: level labels first, then any
-    local r = scanText(gymGui, true)
-    if r then return r end
-    return scanText(gymGui, false)
-end
-
--- ── Progress X/Y ───────────────────────────────────────
-local function getProgress()
-    local function scan(root)
-        for _, v in ipairs(root:GetChildren()) do
-            if v.Visible and (v:IsA("TextLabel") or v:IsA("TextButton")) then
-                local c, m = v.Text:match("(%d+)%s*/%s*(%d+)")
-                if c then
-                    c, m = tonumber(c), tonumber(m)
-                    if m and m >= 5 then return c, m end
-                end
-            end
-            local c, m = scan(v)
-            if c then return c, m end
-        end
-    end
-    return scan(gymGui)
-end
-
--- ── TAP button (treadmill tap zones) ──────────────────
-local tapBtnCache, tapBtnAge = nil, 0
-local function getTapBtn()
-    local now = os.clock()
-    if tapBtnCache and tapBtnCache.Visible and (now-tapBtnAge)<2 then
-        return tapBtnCache
-    end
-    tapBtnAge = now
-    for _, name in ipairs({"TapButton","TapBtn","BtnTap","ButtonTap","Tap"}) do
-        local b = gymGui:FindFirstChild(name, true)
-        if b and b.Visible then tapBtnCache=b; return b end
-    end
-    local function scan(root)
-        for _, v in ipairs(root:GetChildren()) do
-            if (v:IsA("TextButton") or v:IsA("ImageButton")) and v.Visible then
-                local ok, t = pcall(function() return v.Text end)
-                if ok and t:upper() == "TAP" then return v end
-            end
-            local r = scan(v); if r then return r end
-        end
-    end
-    tapBtnCache = scan(gymGui)
-    return tapBtnCache
-end
-
--- ══════════════════════════════════════════════════════════
--- SKILL CHECK RING
--- ══════════════════════════════════════════════════════════
-local function isZoneColor(c)
-    return c.R>0.78 and c.G>0.58 and c.B<0.55  -- warm gold / green
-        or c.R<0.4  and c.G>0.6  and c.B<0.5   -- green zone
-end
-
-local function getZoneRange()
-    if not skillRing then return nil, nil end
-    local mn, mx = math.huge, -math.huge
-    for _, v in ipairs(skillRing:GetChildren()) do
-        if v:IsA("Frame") and v ~= needleFrm and isZoneColor(v.BackgroundColor3) then
-            local r = v.Rotation % 360
-            if r < mn then mn = r end
-            if r > mx then mx = r end
-        end
-    end
-    if mn == math.huge then return nil, nil end
-    return mn, mx
-end
-
-local function skillCheckTick()
-    if not MOD.skillcheck.on then return end
-    if not skillRing or not skillRing.Visible then MOD.skillcheck.fired=false; return end
-    if not needleFrm then needleFrm = findNeedle(skillRing) end
-    if not needleFrm then return end
-
-    local now    = os.clock()
-    local needle = needleFrm.Rotation % 360
-    local zS, zE = getZoneRange()
-    if not zS then return end
-
-    local fireAt = (zS - CFG.SC_EARLY) % 360
-    local inZone
-    if fireAt > zE then
-        inZone = needle >= fireAt or needle <= zE
-    else
-        inZone = needle >= fireAt and needle <= zE
-    end
-
-    if inZone and not MOD.skillcheck.fired and (now - MOD.skillcheck.last) > CFG.SC_COOLDOWN then
-        MOD.skillcheck.fired = true
-        MOD.skillcheck.last  = now
-        if pushBtn then fireBtn(pushBtn) end
-        task.delay(CFG.SC_COOLDOWN, function() MOD.skillcheck.fired = false end)
-    end
-end
-
--- ══════════════════════════════════════════════════════════
--- TREADMILL
--- ══════════════════════════════════════════════════════════
-local function startTreadmill()
-    if not MOD.treadmill.on or MOD.treadmill.run then return end
-    MOD.treadmill.run  = true
-    MOD.treadmill.side = false
-    task.spawn(function()
-        while MOD.treadmill.run do
-            tapKey(Enum.KeyCode.Space)
-            tapKey(MOD.treadmill.side and Enum.KeyCode.J or Enum.KeyCode.F)
-            MOD.treadmill.side = not MOD.treadmill.side
-            local tb = getTapBtn()
-            if tb then fireBtn(tb) end
-            task.wait(CFG.TM_INTERVAL)
-        end
-    end)
-end
-
-local function stopTreadmill()
-    MOD.treadmill.run = false
-end
-
--- ══════════════════════════════════════════════════════════
--- PULLUP
--- ══════════════════════════════════════════════════════════
-local function startPullup()
-    if not MOD.pullup.on or MOD.pullup.run then return end
-    MOD.pullup.run  = true
-    MOD.pullup.side = false
-    task.spawn(function()
-        while MOD.pullup.run do
-            tapKey(MOD.pullup.side and Enum.KeyCode.J or Enum.KeyCode.F)
-            MOD.pullup.side = not MOD.pullup.side
-            task.wait(CFG.PU_INTERVAL)
-        end
-    end)
-end
-
-local function stopPullup()
-    MOD.pullup.run = false
-end
-
--- ══════════════════════════════════════════════════════════
--- SESSION CONTROL
--- ══════════════════════════════════════════════════════════
-local function stopAll(reason)
-    if STATE ~= "active" then return end
-    stopTreadmill()
-    stopPullup()
-    curEx    = nil
-    nilCount = 0
-    STATE    = "cooldown"
-    coolEnd  = os.clock() + CFG.COOLDOWN_DUR
-    print("[AutoGym] ■ stopped:", reason)
-    updateStatus()
-end
-
-local function switchEx(ex)
-    if ex == curEx then return end
-    stopTreadmill()
-    stopPullup()
-    task.wait(0.08)
-    curEx = ex
-    print("[AutoGym] → " .. ex:upper())
-    updateStatus()
-    if ex == "treadmill" then
-        startTreadmill()
-    elseif ex == "pullup" then
-        startPullup()
-    elseif ex == "skillcheck" then
-        -- handled per-frame in skillCheckTick
-    end
-end
-
--- ══════════════════════════════════════════════════════════
--- UI BUILD
--- ══════════════════════════════════════════════════════════
-local UI = {}
-
-local function buildUI()
-    local old = pg:FindFirstChild("AutoGymV5")
-    if old then old:Destroy() end
-
-    local sg = Instance.new("ScreenGui")
-    sg.Name           = "AutoGymV5"
-    sg.ResetOnSpawn   = false
-    sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    sg.DisplayOrder   = 9999
-    sg.IgnoreGuiInset = true
-    sg.Parent         = pg
-
-    -- Panel
-    local panel = Instance.new("Frame")
-    panel.Position        = UDim2.new(0, 12, 0.5, -60)
-    panel.Size            = UDim2.new(0, 158, 0, 0)
-    panel.AutomaticSize   = Enum.AutomaticSize.Y
-    panel.BackgroundColor3 = Color3.fromRGB(12, 12, 18)
-    panel.BorderSizePixel = 0
-    panel.Parent          = sg
-    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 10)
-    local ps = Instance.new("UIStroke", panel)
-    ps.Color = Color3.fromRGB(55, 55, 75); ps.Thickness = 1.2
-
-    -- Header
-    local hdr = Instance.new("Frame")
-    hdr.Size             = UDim2.new(1, 0, 0, 30)
-    hdr.BackgroundColor3 = Color3.fromRGB(24, 24, 36)
-    hdr.BorderSizePixel  = 0
-    hdr.ZIndex           = 2
-    hdr.Parent           = panel
-    Instance.new("UICorner", hdr).CornerRadius = UDim.new(0, 10)
-
-    local htxt = Instance.new("TextLabel")
-    htxt.Size = UDim2.new(1, -34, 1, 0)
-    htxt.Position = UDim2.new(0, 9, 0, 0)
-    htxt.BackgroundTransparency = 1
-    htxt.Text = "⬛ AutoGym"
-    htxt.TextColor3 = Color3.fromRGB(180, 182, 205)
-    htxt.TextSize = 11
-    htxt.Font = Enum.Font.GothamBold
-    htxt.TextXAlignment = Enum.TextXAlignment.Left
-    htxt.ZIndex = 3
-    htxt.Parent = hdr
-
-    local minBtn = Instance.new("TextButton")
-    minBtn.Size = UDim2.new(0, 22, 0, 22)
-    minBtn.Position = UDim2.new(1, -26, 0.5, -11)
-    minBtn.BackgroundColor3 = Color3.fromRGB(45, 45, 62)
-    minBtn.BorderSizePixel = 0
-    minBtn.Text = "−"
-    minBtn.TextColor3 = Color3.fromRGB(200, 200, 220)
-    minBtn.TextSize = 13
-    minBtn.Font = Enum.Font.GothamBold
-    minBtn.ZIndex = 4
-    minBtn.Parent = hdr
-    Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 5)
-
-    -- Content
-    local content = Instance.new("Frame")
-    content.Position      = UDim2.new(0, 0, 0, 30)
-    content.Size          = UDim2.new(1, 0, 0, 0)
-    content.AutomaticSize = Enum.AutomaticSize.Y
-    content.BackgroundTransparency = 1
-    content.Parent        = panel
-
-    local ll = Instance.new("UIListLayout", content)
-    ll.SortOrder = Enum.SortOrder.LayoutOrder
-    ll.Padding   = UDim.new(0, 4)
-
-    local up = Instance.new("UIPadding", content)
-    up.PaddingLeft=UDim.new(0,8); up.PaddingRight=UDim.new(0,8)
-    up.PaddingTop=UDim.new(0,7);  up.PaddingBottom=UDim.new(0,7)
-
-    -- Status
-    local statusLbl = Instance.new("TextLabel")
-    statusLbl.Size = UDim2.new(1, 0, 0, 15)
-    statusLbl.BackgroundTransparency = 1
-    statusLbl.Text = "● idle"
-    statusLbl.TextColor3 = Color3.fromRGB(100, 100, 120)
-    statusLbl.TextSize = 10
-    statusLbl.Font = Enum.Font.Gotham
-    statusLbl.TextXAlignment = Enum.TextXAlignment.Left
-    statusLbl.LayoutOrder = 0
-    statusLbl.Parent = content
-
-    -- Sep
-    local sep = Instance.new("Frame")
-    sep.Size = UDim2.new(1, 0, 0, 1)
-    sep.BackgroundColor3 = Color3.fromRGB(38, 38, 52)
-    sep.BorderSizePixel = 0
-    sep.LayoutOrder = 1
-    sep.Parent = content
-
-    -- Toggle factory
-    local function toggle(name, label, order)
-        local btn = Instance.new("TextButton")
-        btn.Name = name
-        btn.Size = UDim2.new(1, 0, 0, 36)
-        btn.BackgroundColor3 = Color3.fromRGB(30, 115, 68)
-        btn.BorderSizePixel = 0
-        btn.Text = label
-        btn.TextColor3 = Color3.fromRGB(235, 242, 235)
-        btn.TextSize = 10
-        btn.Font = Enum.Font.GothamBold
-        btn.LayoutOrder = order
-        btn.Parent = content
-        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 7)
-        return btn
-    end
-
-    UI.tmBtn = toggle("TM", "🏃 Treadmill  ✓", 2)
-    UI.puBtn = toggle("PU", "💪 Pullup       ✓", 3)
-    UI.abBtn = toggle("AB", "🏋 Angkat/Push ✓", 4)
-
-    UI.sg      = sg
-    UI.panel   = panel
-    UI.header  = hdr
-    UI.content = content
-    UI.status  = statusLbl
-    UI.minBtn  = minBtn
-    UI.open    = true
-end
-
-local function refreshToggles()
-    local function upd(btn, on, label)
-        if not btn then return end
-        if on then
-            btn.Text = label .. " ✓"
-            btn.BackgroundColor3 = Color3.fromRGB(30, 115, 68)
-        else
-            btn.Text = label .. " ✗"
-            btn.BackgroundColor3 = Color3.fromRGB(85, 35, 35)
-        end
-    end
-    upd(UI.tmBtn, MOD.treadmill.on,  "🏃 Treadmill ")
-    upd(UI.puBtn, MOD.pullup.on,     "💪 Pullup      ")
-    upd(UI.abBtn, MOD.skillcheck.on, "🏋 Angkat/Push")
-end
-
-local function updateStatus()
-    if not UI.status then return end
-    if STATE == "idle" then
-        UI.status.Text = "● idle"
-        UI.status.TextColor3 = Color3.fromRGB(100, 100, 120)
-    elseif STATE == "active" then
-        UI.status.Text = "● " .. (curEx or "active")
-        UI.status.TextColor3 = Color3.fromRGB(80, 200, 110)
-    elseif STATE == "cooldown" then
-        UI.status.Text = "⏳ cooldown"
-        UI.status.TextColor3 = Color3.fromRGB(200, 175, 55)
-    end
-end
-
--- ── Minimize ──────────────────────────────────────────
-local function toggleMin()
-    UI.open = not UI.open
-    UI.content.Visible = UI.open
-    UI.minBtn.Text = UI.open and "−" or "+"
-end
-
--- ── Drag ──────────────────────────────────────────────
-local function setupDrag()
-    local dragging = false
-    local dragStart, panStart
-
-    UI.header.InputBegan:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1
-        or inp.UserInputType == Enum.UserInputType.Touch then
-            dragging  = true
-            dragStart = inp.Position
-            panStart  = UI.panel.Position
-            inp.Changed:Connect(function()
-                if inp.UserInputState == Enum.UserInputState.End then
-                    dragging = false
-                end
-            end)
-        end
-    end)
-
-    UIS.InputChanged:Connect(function(inp)
-        if not dragging then return end
-        if inp.UserInputType == Enum.UserInputType.MouseMovement
-        or inp.UserInputType == Enum.UserInputType.Touch then
-            local d = inp.Position - dragStart
-            UI.panel.Position = UDim2.new(
-                panStart.X.Scale, panStart.X.Offset + d.X,
-                panStart.Y.Scale, panStart.Y.Offset + d.Y
-            )
-        end
-    end)
-end
-
--- ── Wire toggle clicks ────────────────────────────────
-local function wireUI()
-    UI.minBtn.MouseButton1Click:Connect(toggleMin)
-    UI.minBtn.TouchTap:Connect(toggleMin)
-
-    local function wired(btn, modKey, label)
-        local function toggle()
-            MOD[modKey].on = not MOD[modKey].on
-            if not MOD[modKey].on then
-                if modKey == "treadmill" then stopTreadmill()
-                elseif modKey == "pullup" then stopPullup() end
-            end
-            refreshToggles()
-        end
-        btn.MouseButton1Click:Connect(toggle)
-        btn.TouchTap:Connect(toggle)
-    end
-
-    wired(UI.tmBtn, "treadmill",  "🏃 Treadmill ")
-    wired(UI.puBtn, "pullup",     "💪 Pullup      ")
-    wired(UI.abBtn, "skillcheck", "🏋 Angkat/Push")
-end
-
--- ══════════════════════════════════════════════════════════
--- COMPLETION SIGNALS
--- ══════════════════════════════════════════════════════════
-gymGui:GetPropertyChangedSignal("Enabled"):Connect(function()
-    if not gymGui.Enabled then stopAll("GUI disabled") end
-end)
-
-local gymConn
-local function watchChar(c)
-    if gymConn then pcall(function() gymConn:Disconnect() end); gymConn=nil end
+local function notify(text)
     pcall(function()
-        gymConn = c:GetAttributeChangedSignal("IsGymming"):Connect(function()
-            if not c:GetAttribute("IsGymming") then stopAll("IsGymming=false") end
-        end)
+        StarterGui:SetCore("SendNotification", { Title = "Gym Bot", Text = text, Duration = 4 })
     end)
+    print("[GymBot] " .. text)
 end
 
-local char = lp.Character or lp.CharacterAdded:Wait()
-watchChar(char)
-lp.CharacterAdded:Connect(function(c) char=c; watchChar(c); initGymRefs() end)
-
--- ══════════════════════════════════════════════════════════
--- MAIN LOOP
--- ══════════════════════════════════════════════════════════
-local pollLast = 0
-
-RunService.RenderStepped:Connect(function()
-    local now = os.clock()
-
-    -- Skill check: every frame for ring precision
-    if STATE == "active" and curEx == "skillcheck" then
-        skillCheckTick()
+-- ---------- helper: trigger signal tanpa input asli ----------
+local function fire(inst, sigName)
+    local sig = inst[sigName or "Activated"]
+    if firesignal then
+        local ok = pcall(firesignal, sig)
+        if ok then return true end
     end
+    if getconnections then
+        local ok = pcall(function()
+            for _, c in ipairs(getconnections(sig)) do c:Fire() end
+        end)
+        if ok then return true end
+    end
+    return false
+end
 
-    -- Throttle the rest
-    if (now - pollLast) < CFG.POLL_RATE then return end
-    pollLast = now
+-- ---------- tunggu GUI minigame ----------
+local gui = PGui:WaitForChild("GymMinigameGui", 30)
+if not gui then
+    warn("[GymBot] GymMinigameGui gak ketemu. Execute setelah game load penuh.")
+    return
+end
+local sc      = gui:WaitForChild("SkillCheck")
+local ls      = gui:WaitForChild("LevelSelect")
+local toast   = gui:WaitForChild("GainToast")
+local exitBtn = gui:WaitForChild("ExitHolder"):WaitForChild("Exit")
 
-    -- Cooldown
-    if STATE == "cooldown" then
-        if now >= coolEnd then
-            STATE = "idle"
-            print("[AutoGym] ready")
-            updateStatus()
+-- rotator = frame 224x224, ZIndex 3 (ring jarum)
+local rotator
+for _, c in ipairs(sc:GetChildren()) do
+    if c:IsA("Frame") and c.Size.X.Offset == 224 and c.ZIndex == 3 then rotator = c; break end
+end
+if not rotator then warn("[GymBot] rotator ring gak ketemu"); return end
+
+-- ---------- FAST: patch config client (butuh getgc) ----------
+if CFG.Fast then
+    local patched = false
+    if getgc then
+        pcall(function()
+            for _, t in ipairs(getgc(true)) do
+                if type(t) == "table" and rawget(t, "GymFolderName") and rawget(t, "LeadIn") then
+                    for k, v in pairs(CFG.FastValues) do t[k] = v end
+                    patched = true
+                    break
+                end
+            end
+        end)
+    end
+    notify(patched and "FAST mode aktif" or "FAST gagal (executor gak support getgc)")
+end
+
+-- ---------- tekan skill check ----------
+local function press()
+    local btn = gui:FindFirstChild("PushButton")
+    if btn and fire(btn) then return end
+    VIM:SendKeyEvent(true,  Enum.KeyCode.Space, false, game)
+    VIM:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+end
+
+-- zona = tick yang ukurannya 3x18 (sisanya 2x10)
+local function readZone()
+    local lo, hi
+    for _, c in ipairs(sc:GetChildren()) do
+        if c:IsA("Frame") and c.Size.X.Offset == 3 and c.Size.Y.Offset == 18 then
+            local a = c.Rotation % 360
+            lo = lo and math.min(lo, a) or a
+            hi = hi and math.max(hi, a) or a
         end
+    end
+    return lo, hi
+end
+
+local last, pressedThisCheck, zlo, zhi = 0, false, nil, nil
+
+track(RunService.RenderStepped:Connect(function()
+    if not alive then return end
+    if not enabled or not CFG.AutoHit then return end
+
+    if not sc.Visible or sc.GroupTransparency > 0.9 then
+        last, pressedThisCheck, zlo, zhi = 0, false, nil, nil
         return
     end
 
-    local ex = scanExercise()
+    local rot = rotator.Rotation % 360
+    local d = rot - last            -- derajat per frame
+    last = rot
 
-    if STATE == "idle" then
-        if ex then
-            STATE    = "active"
-            curEx    = nil
-            nilCount = 0
-            print("[AutoGym] session start →", ex)
-            switchEx(ex)
-            updateStatus()
-        end
+    if d < -1 then                  -- rotation di-reset = ring baru mulai
+        pressedThisCheck, zlo, zhi = false, nil, nil
         return
     end
+    if d <= 0.01 or pressedThisCheck then return end   -- lead-in / udah ditekan
 
-    -- Active
-    if ex then
-        nilCount = 0
-        switchEx(ex)
+    if not zlo then
+        zlo, zhi = readZone()
+        if not zlo then return end
+    end
 
-        local cur, mx = getProgress()
-        if cur and mx and cur >= mx then
-            stopAll("done " .. cur .. "/" .. mx)
-        end
-    else
-        nilCount += 1
-        if CFG.DEBUG then print("[nil]", nilCount) end
-        if nilCount >= CFG.NIL_THRESH then
-            stopAll("label gone ×" .. nilCount)
+    -- game ngecek input di frame berikutnya, jadi prediksi rot + d
+    local width  = math.max(zhi - zlo, 4)
+    local target = zlo + width * CFG.PressAt
+    if rot + d >= target then
+        pressedThisCheck = true
+        press()
+    end
+end))
+
+-- ---------- auto pilih level ----------
+task.spawn(function()
+    while alive do
+        task.wait(0.25)
+        if enabled and CFG.AutoLevel and ls.Visible and ls.GroupTransparency < 0.6 then
+            local b = ls:FindFirstChild("Level" .. CFG.Level, true)
+            if b then fire(b) end
         end
     end
 end)
 
--- ══════════════════════════════════════════════════════════
--- INIT
--- ══════════════════════════════════════════════════════════
-buildUI()
-setupDrag()
-wireUI()
-refreshToggles()
+-- ---------- stop kalau stat maksimal ----------
+track(toast:GetPropertyChangedSignal("Text"):Connect(function()
+    if not CFG.StopOnMax then return end
+    if toast.Text:find("SUDAH MAKSIMAL", 1, true) then
+        enabled = false
+        if sg then
+            local b = sg:FindFirstChildWhichIsA("TextButton")
+            if b then b.Text = "GYM BOT: OFF"; b.BackgroundColor3 = Color3.fromRGB(150, 40, 40) end
+        end
+        notify("Stat sudah maksimal, bot berhenti.")
+        if CFG.ExitOnMax then fire(exitBtn) end
+    end
+end))
 
-print("╔═══════════════════════════════════════════╗")
-print("║  AutoGym v5 loaded ✓                      ║")
-print("║  Treadmill · Pullup · Angkat · Pushup     ║")
-print("╚═══════════════════════════════════════════╝")
+-- ---------- auto masuk lagi (opsional) ----------
+local lastPrompt
+local function hookPrompt(p)
+    if p:IsA("ProximityPrompt") then
+        track(p.Triggered:Connect(function(plr)
+            if plr == LP then lastPrompt = p end
+        end))
+    end
+end
+local gym = workspace:FindFirstChild("GYM")
+if gym then
+    for _, d in ipairs(gym:GetDescendants()) do hookPrompt(d) end
+    track(gym.DescendantAdded:Connect(hookPrompt))
+end
+
+local function hookChar(c)
+    track(c:GetAttributeChangedSignal("IsGymming"):Connect(function()
+        if c:GetAttribute("IsGymming") == false and enabled and CFG.AutoReenter
+           and lastPrompt and lastPrompt.Parent then
+            task.wait(1.5)
+            if alive and enabled and not c:GetAttribute("IsGymming") and fireproximityprompt then
+                pcall(fireproximityprompt, lastPrompt)
+            end
+        end
+    end))
+end
+if LP.Character then hookChar(LP.Character) end
+track(LP.CharacterAdded:Connect(hookChar))
+
+-- ---------- tombol ON/OFF ----------
+sg = Instance.new("ScreenGui")
+sg.Name = "GymBotUI"
+sg.ResetOnSpawn = false
+sg.DisplayOrder = 999
+local okParent = pcall(function()
+    sg.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+end)
+if not okParent or not sg.Parent then
+    -- game nge-skip ScreenGui bernama "TouchGui" pas nyembunyiin UI saat gym
+    sg.Name = "TouchGui"
+    sg.Parent = PGui
+end
+
+local btn = Instance.new("TextButton")
+btn.Size = UDim2.fromOffset(104, 30)
+btn.Position = UDim2.new(0, 10, 0.35, 0)
+btn.BackgroundColor3 = Color3.fromRGB(30, 130, 60)
+btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+btn.Font = Enum.Font.GothamBold
+btn.TextSize = 12
+btn.Text = "GYM BOT: ON"
+btn.BorderSizePixel = 0
+btn.Parent = sg
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+
+local function setEnabled(v)
+    enabled = v
+    btn.Text = v and "GYM BOT: ON" or "GYM BOT: OFF"
+    btn.BackgroundColor3 = v and Color3.fromRGB(30, 130, 60) or Color3.fromRGB(150, 40, 40)
+end
+
+track(btn.Activated:Connect(function() setEnabled(not enabled) end))
+track(UIS.InputBegan:Connect(function(i, g)
+    if g then return end
+    if i.KeyCode == Enum.KeyCode.RightShift then setEnabled(not enabled) end
+end))
+
+notify(string.format("Aktif | Level %d | AutoHit %s | Fast %s",
+    CFG.Level, tostring(CFG.AutoHit), tostring(CFG.Fast)))
